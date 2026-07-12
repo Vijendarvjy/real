@@ -534,7 +534,11 @@ def _get_openai_key() -> Optional[str]:
 
 
 def _get_hf_token() -> Optional[str]:
-    """Checks a plain environment variable first, then Streamlit's secrets store."""
+    """Checks (in order): a token manually pasted into the sidebar this
+    session, a plain environment variable, then Streamlit's secrets store."""
+    manual = st.session_state.get("_manual_hf_token")
+    if manual:
+        return manual
     token = os.environ.get("HF_TOKEN")
     if token:
         return token
@@ -641,15 +645,35 @@ def export_summary_markdown() -> bytes:
 # ============================================================
 
 init_session_state()
+
+# ---------------------------------------------------------------- Sidebar (token entry first, so it's live this run)
+st.sidebar.title("🏢 Apartment Designer")
+
+with st.sidebar.expander("🔑 AI setup", expanded="_manual_hf_token" not in st.session_state):
+    st.caption("Paste a free Hugging Face token to enable real AI recommendations "
+               "and image renders — no billing setup required.")
+    st.caption("Get one at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) "
+               "(any token works; 'Read' is enough).")
+    entered_token = st.text_input("HF_TOKEN", type="password",
+                                   value=st.session_state.get("_manual_hf_token", ""),
+                                   key="_hf_token_input",
+                                   placeholder="hf_...")
+    if st.button("Save token", key="_save_hf_token"):
+        if entered_token.strip():
+            st.session_state["_manual_hf_token"] = entered_token.strip()
+            st.session_state.pop("_provider_init_error", None)
+            st.rerun()
+        else:
+            st.session_state.pop("_manual_hf_token", None)
+
 provider = get_provider()
 USING_STUB = provider.__class__.__name__ == "StubProvider"
 
-
-# ---------------------------------------------------------------- Sidebar
-st.sidebar.title("🏢 Apartment Designer")
 if USING_STUB:
-    reason = st.session_state.get("_provider_init_error", "No OPENAI_API_KEY detected.")
+    reason = st.session_state.get("_provider_init_error", "No HF_TOKEN or OPENAI_API_KEY detected.")
     st.sidebar.warning(f"Demo mode — {reason}", icon="⚠️")
+else:
+    st.sidebar.success(f"AI connected ({provider.__class__.__name__.replace('Provider', '')})", icon="✅")
 
 nav_options = ["🏠 Apartment Setup"] + [
     f"{cfg['icon']} {room}" for room, cfg in ROOM_CONFIG.items()
