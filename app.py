@@ -405,6 +405,102 @@ Return ONLY a JSON object, no markdown fences, no preamble, with this exact shap
         return recommendation
 
 
+class HuggingFaceProvider(AIDesignProvider):
+    """Uses Hugging Face Inference Providers: an open chat model for the
+    design brief (OpenAI-compatible chat completions via HF's router) and
+    FLUX.1-schnell (Black Forest Labs, Apache-2.0 — free for commercial
+    use, fast) for the preview render. Needs only an HF_TOKEN, and HF's
+    serverless free tier avoids the OpenAI billing/quota setup entirely."""
+
+    def __init__(self, hf_token: Optional[str] = None,
+                 text_model: str = "Qwen/Qwen2.5-7B-Instruct",
+                 image_model: str = "black-forest-labs/FLUX.1-schnell"):
+        from huggingface_hub import InferenceClient
+        self.hf_token = hf_token or os.environ.get("HF_TOKEN")
+        if not self.hf_token:
+            raise RuntimeError("HF_TOKEN is not set. Add it to your environment or .env file.")
+        self.client = InferenceClient(api_key=self.hf_token)
+        self.text_model = text_model
+        self.image_model = image_model
+
+    def _build_prompt(self, req: DesignRequest) -> str:
+        selection_lines = "\n".join(f"- {k}: {v}" for k, v in req.selections.items())
+        return f"""
+You are a senior interior designer producing a design brief for a {req.room_type}
+in an apartment. Room dimensions: {req.length_ft} ft x {req.width_ft} ft, ceiling
+height {req.height_ft} ft (area ~{_area_sqft(req)} sq ft).
+
+Design style: {req.style}
+Budget tier: {req.budget_tier}
+Client selections:
+{selection_lines}
+Additional notes: {req.notes or "None"}
+
+Return ONLY a JSON object, no markdown fences, no preamble, with this exact shape:
+{{
+  "summary": "2-3 sentence overview of the design concept for this room",
+  "layout_plan": "short paragraph describing furniture/fixture placement given the dimensions",
+  "materials": ["material or finish recommendation", "..."],
+  "color_palette": ["color name or hex-ish description", "..."],
+  "estimated_cost_range": "a rough cost range in INR for this room at the given budget tier, e.g. '₹1.8L - ₹2.5L'",
+  "image_prompt": "a single vivid, concrete prompt (no brand names, no people) describing this room's interior for an AI image generator, incorporating the style, materials, colors and approximate proportions"
+}}
+""".strip()
+
+    def generate_recommendation(self, req: DesignRequest) -> DesignResult:
+        try:
+            response = self.client.chat_completion(
+                model=self.text_model,
+                messages=[{"role": "user", "content": self._build_prompt(req)}],
+                temperature=0.7,
+                max_tokens=800,
+            )
+            raw_text = response.choices[0].message.content or ""
+        except Exception as exc:
+            logger.exception("Hugging Face text generation failed")
+            return DesignResult(
+                summary="", layout_plan="", materials=[], color_palette=[],
+                estimated_cost_range="", raw_text="", error=str(exc),
+            )
+
+        data = _extract_json(raw_text)
+        if data is None:
+            summary_match = re.search(r'"summary"\s*:\s*"([^"]+)"', raw_text)
+            return DesignResult(
+                summary=summary_match.group(1) if summary_match else raw_text[:300],
+                layout_plan="", materials=[], color_palette=[],
+                estimated_cost_range="", raw_text=raw_text,
+                error="Could not fully parse AI response as JSON; showing best-effort text.",
+            )
+
+        result = DesignResult(
+            summary=data.get("summary", ""),
+            layout_plan=data.get("layout_plan", ""),
+            materials=data.get("materials", []) or [],
+            color_palette=data.get("color_palette", []) or [],
+            estimated_cost_range=data.get("estimated_cost_range", ""),
+            raw_text=raw_text,
+        )
+        result.__dict__["_image_prompt"] = data.get("image_prompt", "")
+        return result
+
+    def generate_preview_image(self, req: DesignRequest, recommendation: DesignResult) -> DesignResult:
+        prompt = recommendation.__dict__.get("_image_prompt") or (
+            f"Interior photo of a {req.style} {req.room_type}, {_area_sqft(req)} sq ft, "
+            f"realistic architectural visualization, no text, no people"
+        )
+        try:
+            image = self.client.text_to_image(prompt=prompt, model=self.image_model)
+            import io as _io
+            buf = _io.BytesIO()
+            image.save(buf, format="PNG")
+            recommendation.image_bytes = buf.getvalue()
+        except Exception as exc:
+            logger.exception("Hugging Face image generation failed")
+            recommendation.error = (recommendation.error or "") + f" | Image generation failed: {exc}"
+        return recommendation
+
+
 class StubProvider(AIDesignProvider):
     """No-network fallback so the UI is fully explorable without an API key."""
 
@@ -412,7 +508,7 @@ class StubProvider(AIDesignProvider):
         return DesignResult(
             summary=f"[Demo mode] A {req.style.lower()} {req.room_type.lower()} concept "
                      f"tailored to your {_area_sqft(req)} sq ft space.",
-            layout_plan="Add your OPENAI_API_KEY to generate a real, dimension-aware layout plan.",
+            layout_plan="Add HF_TOKEN (Hugging Face, free) or OPENAI_API_KEY to generate a real, dimension-aware layout plan.",
             materials=[v for v in req.selections.values()][:4],
             color_palette=["Warm White", "Charcoal Grey", "Brass Accents"],
             estimated_cost_range="₹1.5L - ₹3L (placeholder)",
@@ -420,7 +516,7 @@ class StubProvider(AIDesignProvider):
         )
 
     def generate_preview_image(self, req: DesignRequest, recommendation: DesignResult) -> DesignResult:
-        recommendation.error = "Demo mode: no image generated. Add OPENAI_API_KEY for AI renders."
+        recommendation.error = "Demo mode: no image generated. Add HF_TOKEN (free) or OPENAI_API_KEY for AI renders."
         return recommendation
 
 
@@ -437,9 +533,29 @@ def _get_openai_key() -> Optional[str]:
         return None
 
 
+def _get_hf_token() -> Optional[str]:
+    """Checks a plain environment variable first, then Streamlit's secrets store."""
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        return token
+    try:
+        return st.secrets.get("HF_TOKEN")
+    except Exception:
+        return None
+
+
 def get_provider() -> AIDesignProvider:
-    """Factory: returns a working OpenAI provider if a key is configured,
-    otherwise falls back to the stub so the app never hard-crashes."""
+    """Factory: tries Hugging Face first (simplest setup, generous free
+    tier), then OpenAI, then falls back to the stub so the app never
+    hard-crashes without any key configured."""
+    hf_token = _get_hf_token()
+    if hf_token:
+        try:
+            return HuggingFaceProvider(hf_token=hf_token)
+        except Exception as exc:
+            logger.exception("Hugging Face provider init failed, trying OpenAI")
+            st.session_state["_provider_init_error"] = f"Hugging Face: {exc}"
+
     api_key = _get_openai_key()
     if api_key:
         try:
@@ -447,9 +563,11 @@ def get_provider() -> AIDesignProvider:
         except Exception as exc:
             logger.exception("Falling back to StubProvider")
             st.session_state["_provider_init_error"] = str(exc)
-    elif "OPENAI_API_KEY" not in os.environ:
+            return StubProvider()
+
+    if not hf_token and "OPENAI_API_KEY" not in os.environ:
         st.session_state["_provider_init_error"] = (
-            "No OPENAI_API_KEY found in environment variables or st.secrets."
+            "No HF_TOKEN or OPENAI_API_KEY found in environment variables or st.secrets."
         )
     return StubProvider()
 
