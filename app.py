@@ -4,7 +4,7 @@ AI Apartment Interior Designer — single-file Streamlit app.
 Select and customize interior designs (bedrooms, hall, kitchen, doors,
 windows, TV unit, bathroom) based on real room dimensions, with
 AI-generated recommendations and preview render images (OpenAI GPT +
-gpt-image-1 / DALL-E). Everything lives in this one file on purpose —
+gpt-image-2 / GPT-Image models). Everything lives in this one file on purpose —
 avoids any multi-file import path issues on Streamlit Cloud.
 
 Setup:
@@ -298,11 +298,15 @@ def _area_sqft(req: DesignRequest) -> float:
 
 class OpenAIProvider(AIDesignProvider):
     """Uses OpenAI Chat Completions for the design brief and
-    gpt-image-1 (falls back to DALL-E 3) for the preview render."""
+    GPT Image 2 (current flagship image model, best photorealism and
+    prompt adherence) for the preview render. Note: DALL-E 2/3 were
+    removed from the OpenAI API in May 2026, so no fallback to those."""
 
     def __init__(self, api_key: Optional[str] = None,
                  text_model: str = "gpt-4o-mini",
-                 image_model: str = "gpt-image-1"):
+                 image_model: str = "gpt-image-2",
+                 image_quality: str = "high",
+                 image_size: str = "1536x1024"):
         from openai import OpenAI  # imported lazily so app still loads without the package configured
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not self.api_key:
@@ -310,6 +314,8 @@ class OpenAIProvider(AIDesignProvider):
         self.client = OpenAI(api_key=self.api_key)
         self.text_model = text_model
         self.image_model = image_model
+        self.image_quality = image_quality
+        self.image_size = image_size
 
     def _build_prompt(self, req: DesignRequest) -> str:
         selection_lines = "\n".join(f"- {k}: {v}" for k, v in req.selections.items())
@@ -382,7 +388,8 @@ Return ONLY a JSON object, no markdown fences, no preamble, with this exact shap
             image = self.client.images.generate(
                 model=self.image_model,
                 prompt=prompt,
-                size="1024x1024",
+                size=self.image_size,
+                quality=self.image_quality,
                 n=1,
             )
             b64 = getattr(image.data[0], "b64_json", None)
@@ -624,6 +631,17 @@ def render_room_page(room_name: str):
                           key=f"{room_name}_notes")
 
     st.divider()
+    qcol1, qcol2 = st.columns([1, 2])
+    with qcol1:
+        render_quality = st.radio(
+            "Preview quality",
+            ["Draft (fast, cheaper)", "Final (high quality)"],
+            key=f"{room_name}_quality",
+            horizontal=False,
+        )
+    with qcol2:
+        st.caption("Use Draft while you're still tweaking materials and layout, "
+                    "then switch to Final for the polished render.")
     generate = st.button(f"✨ Generate AI Design for {room_name}", type="primary", key=f"{room_name}_generate")
 
     existing = get_room_design(room_name)
@@ -633,6 +651,9 @@ def render_room_page(room_name: str):
             room_type=room_name, length_ft=length, width_ft=width, height_ft=height,
             style=style, budget_tier=budget, selections=selections, notes=notes,
         )
+        is_final = render_quality.startswith("Final")
+        if isinstance(provider, OpenAIProvider):
+            provider.image_quality = "high" if is_final else "medium"
         with st.spinner("Designing your space..."):
             result = provider.generate_recommendation(req)
             if not result.error or "Could not fully parse" in (result.error or ""):
