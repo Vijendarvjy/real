@@ -417,15 +417,33 @@ class StubProvider(AIDesignProvider):
         return recommendation
 
 
+def _get_openai_key() -> Optional[str]:
+    """Checks a plain environment variable first (local runs, .env),
+    then Streamlit Cloud's secrets store, which is NOT the same as
+    os.environ unless you've mirrored it there yourself."""
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        return key
+    try:
+        return st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        return None
+
+
 def get_provider() -> AIDesignProvider:
     """Factory: returns a working OpenAI provider if a key is configured,
     otherwise falls back to the stub so the app never hard-crashes."""
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = _get_openai_key()
     if api_key:
         try:
             return OpenAIProvider(api_key=api_key)
-        except Exception:
+        except Exception as exc:
             logger.exception("Falling back to StubProvider")
+            st.session_state["_provider_init_error"] = str(exc)
+    elif "OPENAI_API_KEY" not in os.environ:
+        st.session_state["_provider_init_error"] = (
+            "No OPENAI_API_KEY found in environment variables or st.secrets."
+        )
     return StubProvider()
 
 
@@ -505,8 +523,8 @@ USING_STUB = provider.__class__.__name__ == "StubProvider"
 # ---------------------------------------------------------------- Sidebar
 st.sidebar.title("🏢 Apartment Designer")
 if USING_STUB:
-    st.sidebar.warning("Demo mode — set OPENAI_API_KEY to enable real AI "
-                        "recommendations and image renders.", icon="⚠️")
+    reason = st.session_state.get("_provider_init_error", "No OPENAI_API_KEY detected.")
+    st.sidebar.warning(f"Demo mode — {reason}", icon="⚠️")
 
 nav_options = ["🏠 Apartment Setup"] + [
     f"{cfg['icon']} {room}" for room, cfg in ROOM_CONFIG.items()
